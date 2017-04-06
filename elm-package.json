@@ -1,5 +1,5 @@
 {
-    "version": "2.0.0",
+    "version": "2.0.1",
     "summary": "Slate Query Engine",
     "repository": "https://github.com/elm-slate/query.git",
     "license": "Unlicense",
@@ -13,7 +13,7 @@
     "dependencies": {
         "elm-lang/core": "5.0.0 <= v < 6.0.0",
         "elm-community/list-extra": "6.0.0 <= v < 7.0.0",
-        "elm-community/maybe-extra": "3.1.0 <= v < 4.0.0",
+		"elm-community/maybe-extra": "4.0.0 <= v < 5.0.0",
         "panosoft/elm-string-utils": "2.0.0 <= v < 3.0.0",
         "panosoft/elm-postgres": "4.0.0 <= v < 5.0.0",
         "panosoft/elm-debugf": "2.0.0 <= v < 3.0.0",
