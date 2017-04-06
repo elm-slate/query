@@ -10,12 +10,13 @@ module Slate.Engine.Query
         , buildQueryTemplate
         , parametricReplace
         , buildMsgDict
+        , getQueryEventTypes
         )
 
 {-|
     Slate Query module.
 
-@docs NodeQuery , Query , MsgDict , MsgDictEntry , EventTagger, QueryId, mtQuery , buildQueryTemplate , parametricReplace , buildMsgDict
+@docs NodeQuery , Query , MsgDict , MsgDictEntry , EventTagger, QueryId, mtQuery , buildQueryTemplate , parametricReplace , buildMsgDict, getQueryEventTypes
 -}
 
 import String exposing (..)
@@ -51,11 +52,15 @@ type alias NodeQuery msg =
     }
 
 
+type alias Children msg =
+    List (Query msg)
+
+
 {-|
     A Query definition.
 -}
 type Query msg
-    = Node (NodeQuery msg) (List (Query msg))
+    = Node (NodeQuery msg) (Children msg)
     | Leaf (NodeQuery msg)
 
 
@@ -168,35 +173,67 @@ buildMsgDict query =
         build query Dict.empty
 
 
+{-| Get EntityEventTypes for a Query
+-}
+getQueryEventTypes : Query msg -> List EntityEventTypes
+getQueryEventTypes query =
+    let
+        parentChildRelationships =
+            parentChild query
+    in
+        depthDict query
+            |> Dict.values
+            |> List.map
+                (\queriesAtDepth ->
+                    let
+                        children parent =
+                            Dict.get parent.schema.entityName parentChildRelationships ?= []
+                    in
+                        queriesAtDepth
+                            |> List.map (\parent -> getEventTypes parent (children parent))
+                )
+            |> List.concat
+
+
 
 ---------------------------------------------------------------------------------------------------------
 -- PRIVATE
 ---------------------------------------------------------------------------------------------------------
 
 
-depthDict : Query msg -> Dict Int (List (NodeQuery msg))
+type alias ParentChildRelationships msg =
+    Dict String (List (NodeQuery msg))
+
+
+type alias Depth =
+    Int
+
+
+type alias DepthDict msg =
+    Dict Depth (List (NodeQuery msg))
+
+
+depthDict : Query msg -> DepthDict msg
 depthDict query =
     let
-        add : NodeQuery msg -> Int -> Dict Int (List (NodeQuery msg)) -> Dict Int (List (NodeQuery msg))
         add nodeQuery depth dict =
             Dict.insert depth (nodeQuery :: Dict.get depth dict ?= []) dict
 
-        addChildren : List (Query msg) -> Int -> Dict Int (List (NodeQuery msg)) -> Dict Int (List (NodeQuery msg))
         addChildren children depth dict =
-            case children of
-                child :: rest ->
-                    depthDictInternal child depth <| addChildren rest depth dict
-
-                [] ->
-                    dict
+            children
+                |> List.foldl (\child dict -> depthDictInternal child depth dict) dict
 
         depthDictInternal query depth dict =
-            case query of
-                Node nodeQuery children ->
-                    add nodeQuery depth <| addChildren children (depth + 1) dict
+            let
+                ( newDict, nodeQuery ) =
+                    case query of
+                        Node nodeQuery children ->
+                            ( addChildren children (depth + 1) dict, nodeQuery )
 
-                Leaf nodeQuery ->
-                    add nodeQuery depth dict
+                        Leaf nodeQuery ->
+                            ( dict, nodeQuery )
+            in
+                add nodeQuery depth newDict
     in
         depthDictInternal query 0 Dict.empty
 
@@ -226,7 +263,7 @@ toFlatListMap f =
     List.map f << toFlatList
 
 
-toFlatList2 : Query msg -> List ( NodeQuery msg, List (Query msg) )
+toFlatList2 : Query msg -> List ( NodeQuery msg, Children msg )
 toFlatList2 query =
     case query of
         Node nodeQuery children ->
@@ -236,7 +273,7 @@ toFlatList2 query =
             [ ( nodeQuery, [] ) ]
 
 
-toFlatListMap2 : (NodeQuery msg -> List (Query msg) -> a) -> Query msg -> List a
+toFlatListMap2 : (NodeQuery msg -> Children msg -> a) -> Query msg -> List a
 toFlatListMap2 f2 =
     List.map (tupToArgs f2) << toFlatList2
 
@@ -298,12 +335,12 @@ extractNodeQuery query =
             nodeQuery
 
 
-childEntityNames : NodeQuery msg -> List (Query msg) -> ( String, List (NodeQuery msg) )
+childEntityNames : NodeQuery msg -> Children msg -> ( String, List (NodeQuery msg) )
 childEntityNames nodeQuery children =
     ( nodeQuery.schema.entityName, List.map extractNodeQuery children )
 
 
-parentChild : Query msg -> Dict String (List (NodeQuery msg))
+parentChild : Query msg -> ParentChildRelationships msg
 parentChild query =
     let
         filter =
@@ -320,8 +357,7 @@ parentChild query =
                 [] ->
                     []
     in
-        Dict.fromList
-            parentChild
+        Dict.fromList parentChild
 
 
 {-| clause to be added on first query of set
@@ -430,11 +466,11 @@ templateReplace =
     parametricReplace "{" "}"
 
 
-buildEntityTemplate : Dict String (List (NodeQuery msg)) -> NodeQuery msg -> String
-buildEntityTemplate parentChild parent =
+buildEntityTemplate : ParentChildRelationships msg -> NodeQuery msg -> String
+buildEntityTemplate parentChildRelationships parent =
     let
         children =
-            Dict.get parent.schema.entityName parentChild ?= []
+            Dict.get parent.schema.entityName parentChildRelationships ?= []
 
         ( entityName, types ) =
             getEventTypes parent children
@@ -464,30 +500,14 @@ buildEntityTemplate parentChild parent =
             entityTemplate
 
 
-buildSqlTemplate : Dict Int (List (NodeQuery msg)) -> Dict String (List (NodeQuery msg)) -> List String
-buildSqlTemplate depthDict parentChild =
-    let
-        maxDepth =
-            List.length <| Dict.keys depthDict
-
-        build : Int -> List String -> List String
-        build depth templates =
-            let
-                queriesAtDepth =
-                    Dict.get depth depthDict ?= []
-
-                entityTemplates =
-                    String.join "\n\tOR " <| List.map (buildEntityTemplate parentChild) queriesAtDepth
-
-                template =
-                    templateReplace
-                        [ ( "entityTemplates", entityTemplates )
-                        ]
-                        sqlTemplate
-
-                newTemplates =
-                    template :: templates
-            in
-                (depth > 0) ?! ( \_ -> build (depth - 1) newTemplates, \_ -> newTemplates )
-    in
-        build (maxDepth - 1) []
+buildSqlTemplate : DepthDict msg -> ParentChildRelationships msg -> List String
+buildSqlTemplate depthDict parentChildRelationships =
+    depthDict
+        |> Dict.values
+        |> List.map
+            (\queriesAtDepth ->
+                queriesAtDepth
+                    |> List.map (buildEntityTemplate parentChildRelationships)
+                    |> String.join "\n\tOR"
+                    |> (\templateValue -> (templateReplace [ ( "entityTemplates", templateValue ) ] sqlTemplate))
+            )
