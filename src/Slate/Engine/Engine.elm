@@ -257,7 +257,7 @@ update config msg model =
    Execute Slate Query.
 -}
 executeQuery : Config msg -> DbConnectionInfo -> Model msg -> Maybe String -> Query msg -> List String -> Result (List String) ( Model msg, Cmd msg, Int )
-executeQuery config dbInfo model additionalCriteria query rootIds =
+executeQuery config dbConnectionInfo model additionalCriteria query rootIds =
     let
         templateResult =
             buildQueryTemplate query
@@ -292,7 +292,7 @@ executeQuery config dbInfo model additionalCriteria query rootIds =
                             }
 
                         ( newModel, cmd ) =
-                            connectToDb config dbInfo { model | nextId = model.nextId + 1, queryStates = Dict.insert queryStateId queryState model.queryStates } queryStateId
+                            connectToDb config dbConnectionInfo { model | nextId = model.nextId + 1, queryStates = Dict.insert queryStateId queryState model.queryStates } queryStateId
                     in
                         ( newModel, cmd, queryStateId )
                 )
@@ -302,7 +302,7 @@ executeQuery config dbInfo model additionalCriteria query rootIds =
     Refresh an existing Slate Query, i.e. process events since the last `executeQuery` or `refreshQuery`.
 -}
 refreshQuery : Config msg -> DbConnectionInfo -> Model msg -> QueryStateId -> Result String ( Model msg, Cmd msg )
-refreshQuery config dbInfo model queryStateId =
+refreshQuery config dbConnectionInfo model queryStateId =
     Dict.get queryStateId model.queryStates
         |?> (\queryState ->
                 let
@@ -310,7 +310,7 @@ refreshQuery config dbInfo model queryStateId =
                         { queryState | currentTemplate = 0, firstTemplateWithDataMaxId = -1 }
 
                     ( newModel, cmd ) =
-                        connectToDb config dbInfo { model | queryStates = Dict.insert queryStateId newQueryState model.queryStates } queryStateId
+                        connectToDb config dbConnectionInfo { model | queryStates = Dict.insert queryStateId newQueryState model.queryStates } queryStateId
                 in
                     Ok ( newModel, cmd )
             )
@@ -547,9 +547,6 @@ startQuery config model queryStateId connectionId =
 
                         sql =
                             RegexU.replace All "\\{\\{.+?\\-entityIds\\}\\}" (RegexU.simpleReplacer "1!=1") sqlWithEntityIds
-
-                        ll =
-                            (debugFLog config) "sql" sql
                     in
                         ( updateQueryState model { queryState | currentTemplate = queryState.currentTemplate + 1 }
                         , Postgres.query (QueryError queryStateId) (Events queryStateId) connectionId sql config.queryBatchSize
@@ -654,23 +651,23 @@ nextQuery queryStateId connectionId =
 
 
 connectToDbCmd : Config msg -> DbConnectionInfo -> Model msg -> QueryStateId -> FailureTagger ( ConnectionId, String ) Msg -> Cmd Msg
-connectToDbCmd config dbInfo model queryStateId failureTagger =
+connectToDbCmd config dbConnectionInfo model queryStateId failureTagger =
     Postgres.connect
         failureTagger
         (Connect queryStateId)
         (ConnectionLost queryStateId)
-        dbInfo.timeout
-        dbInfo.host
-        dbInfo.port_
-        dbInfo.database
-        dbInfo.user
-        dbInfo.password
+        dbConnectionInfo.timeout
+        dbConnectionInfo.host
+        dbConnectionInfo.port_
+        dbConnectionInfo.database
+        dbConnectionInfo.user
+        dbConnectionInfo.password
 
 
 connectToDb : Config msg -> DbConnectionInfo -> Model msg -> QueryStateId -> ( Model msg, Cmd msg )
-connectToDb config dbInfo model queryStateId =
+connectToDb config dbConnectionInfo model queryStateId =
     let
         ( retryModel, retryCmd ) =
-            Retry.retry retryConfig model.retryModel (ConnectError queryStateId) RetryConnectCmd (connectToDbCmd config dbInfo model queryStateId)
+            Retry.retry retryConfig model.retryModel (ConnectError queryStateId) RetryConnectCmd (connectToDbCmd config dbConnectionInfo model queryStateId)
     in
         { model | retryModel = retryModel } ! [ Cmd.map config.routeToMeTagger retryCmd ]
