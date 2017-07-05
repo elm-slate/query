@@ -1,7 +1,6 @@
 module Slate.Engine.Engine
     exposing
-        ( QueryStateId
-        , Config
+        ( Config
         , Model
         , Msg
         , init
@@ -10,14 +9,16 @@ module Slate.Engine.Engine
         , refreshQuery
         , disposeQuery
         , cascadingDeleteOccurred
+        , importQueryMismatchError
         , importQueryState
         , exportQueryState
+        , isGoodQueryState
         )
 
 {-|
     Slate Query Engine.
 
-@docs QueryStateId, Config , Model , Msg , init , update , executeQuery , refreshQuery , disposeQuery , cascadingDeleteOccurred, importQueryState , exportQueryState
+@docs Config , Model , Msg , init , update , executeQuery , refreshQuery , disposeQuery , cascadingDeleteOccurred, importQueryMismatchError, importQueryState , exportQueryState, isGoodQueryState
 -}
 
 import String exposing (..)
@@ -26,12 +27,12 @@ import Dict exposing (..)
 import Set exposing (..)
 import Json.Decode as JD exposing (..)
 import Json.Encode as JE exposing (..)
-import Utils.Json as JsonU exposing ((///), (<||))
-import List.Extra as ListE exposing (..)
+import Utils.Json as Json exposing ((///), (<||))
+import List.Extra as List exposing (..)
 import Regex exposing (HowMany(All, AtMost))
 import Utils.Regex as RegexU
 import DebugF exposing (..)
-import Slate.Engine.Query exposing (..)
+import Slate.Engine.Query as EngineQuery exposing (..)
 import Slate.Common.Event exposing (..)
 import Slate.Common.Entity exposing (..)
 import Slate.Common.Db exposing (..)
@@ -41,7 +42,7 @@ import Utils.Ops exposing (..)
 import Utils.Tuple exposing (..)
 import Utils.Error exposing (..)
 import Utils.Log exposing (..)
-import Postgres exposing (..)
+import Postgres exposing (ConnectionId, QueryTagger, Sql)
 import ParentChildUpdate
 import Retry exposing (FailureTagger)
 
@@ -50,21 +51,15 @@ import Retry exposing (FailureTagger)
 
 
 {-|
-    QueryState id.
--}
-type alias QueryStateId =
-    QueryId
-
-
-{-|
     Slate Engine configuration.
 -}
 type alias Config msg =
     { debug : Bool
-    , logTagger : ( LogLevel, ( QueryStateId, String ) ) -> msg
-    , errorTagger : ( ErrorType, ( QueryStateId, String ) ) -> msg
+    , connectionRetryMax : Int
+    , logTagger : ( LogLevel, ( QueryId, String ) ) -> msg
+    , errorTagger : ( ErrorType, ( QueryId, String ) ) -> msg
     , eventProcessingErrorTagger : ( String, String ) -> msg
-    , completionTagger : QueryStateId -> msg
+    , completionTagger : QueryId -> msg
     , routeToMeTagger : Msg -> msg
     , queryBatchSize : Int
     }
@@ -74,9 +69,9 @@ type alias Config msg =
     Engine Model.
 -}
 type alias Model msg =
-    { nextId : QueryStateId
-    , queryStates : Dict QueryStateId (QueryState msg)
-    , retryModel : Retry.Model Msg
+    { nextId : QueryId
+    , queryStates : Dict QueryId (QueryState msg)
+    , retryModels : Dict QueryId (Retry.Model Msg)
     }
 
 
@@ -85,15 +80,15 @@ type alias Model msg =
 -}
 type Msg
     = Nop
-    | ConnectError QueryStateId ( ConnectionId, String )
-    | Connect QueryStateId ConnectionId
-    | ConnectionLost QueryStateId ( ConnectionId, String )
-    | DisconnectError QueryStateId ( ConnectionId, String )
-    | Disconnect QueryStateId ConnectionId
-    | Events QueryStateId ( ConnectionId, List String )
-    | QueryError QueryStateId ( ConnectionId, String )
+    | ConnectError QueryId ( ConnectionId, String )
+    | Connect QueryId ConnectionId
+    | ConnectionLost QueryId ( ConnectionId, String )
+    | DisconnectError QueryId ( ConnectionId, String )
+    | Disconnect QueryId ConnectionId
+    | Events QueryId ( ConnectionId, List String )
+    | QueryError QueryId ( ConnectionId, String )
     | RetryConnectCmd Int Msg (Cmd Msg)
-    | RetryModule (Retry.Msg Msg)
+    | RetryMsg QueryId (Retry.Msg Msg)
 
 
 {-|
@@ -103,7 +98,7 @@ initModel : ( Model msg, List (Cmd msg) )
 initModel =
     ( { nextId = 0
       , queryStates = Dict.empty
-      , retryModel = Retry.initModel
+      , retryModels = Dict.empty
       }
     , []
     )
@@ -127,76 +122,82 @@ init config =
 update : Config msg -> Msg -> Model msg -> ( ( Model msg, Cmd Msg ), List msg )
 update config msg model =
     let
-        logMsg queryStateId message =
-            config.logTagger ( LogLevelInfo, ( queryStateId, message ) )
+        logMsg queryId message =
+            config.logTagger ( LogLevelInfo, ( queryId, message ) )
 
-        nonFatal queryStateId error =
-            config.errorTagger ( NonFatalError, ( queryStateId, error ) )
+        nonFatal queryId error =
+            config.errorTagger ( NonFatalError, ( queryId, error ) )
 
-        fatal queryStateId error =
-            config.errorTagger ( FatalError, ( queryStateId, error ) )
+        fatal queryId error =
+            config.errorTagger ( FatalError, ( queryId, error ) )
 
-        updateRetry =
-            ParentChildUpdate.updateChildParent (Retry.update retryConfig) (update config) .retryModel RetryModule (\model retryModel -> { model | retryModel = retryModel })
+        getRetryModel config model queryId =
+            Dict.get queryId model.retryModels
+                ?!= (\_ -> Debug.crash ("BUG: Cannot find retry model for queryId:" +-+ queryId))
+
+        updateRetry queryId =
+            ParentChildUpdate.updateChildParent (Retry.update <| retryConfig config queryId) (update config) (\model -> getRetryModel config model queryId) (RetryMsg queryId) (\model retryModel -> { model | retryModels = Dict.insert queryId retryModel model.retryModels })
     in
         case msg of
             Nop ->
                 ( model ! [], [] )
 
-            ConnectError queryStateId ( connectionId, error ) ->
+            ConnectError queryId ( connectionId, error ) ->
                 let
                     l =
-                        (debugLog config) "ConnectError" ( queryStateId, connectionId, error )
+                        (debugLog config) "ConnectError" ( queryId, connectionId, error )
                 in
-                    connectionFailure config model queryStateId error
+                    { model | retryModels = Dict.remove queryId model.retryModels }
+                        |> (\model -> connectionFailure config model queryId error)
 
-            ConnectionLost queryStateId ( connectionId, error ) ->
+            ConnectionLost queryId ( connectionId, error ) ->
                 let
                     l =
-                        (debugLog config) "ConnectLost" ( queryStateId, connectionId, error )
+                        (debugLog config) "ConnectLost" ( queryId, connectionId, error )
                 in
-                    connectionFailure config model queryStateId error
+                    connectionFailure config model queryId error
 
-            Connect queryStateId connectionId ->
+            Connect queryId connectionId ->
                 let
                     l =
-                        (debugLog config) "Connect" ( queryStateId, connectionId )
+                        (debugLog config) "Connect" ( queryId, connectionId )
 
                     queryState =
-                        getQueryState queryStateId model
-
-                    ( newModel, cmd ) =
-                        startQuery config model queryStateId connectionId
+                        getQueryState queryId model
                 in
-                    ( newModel ! [ cmd ], [] )
+                    { model | retryModels = Dict.remove queryId model.retryModels }
+                        |> (\model ->
+                                startQuery config model queryId connectionId
+                                    |> (\( model, cmd ) -> ( model ! [ cmd ], [] ))
+                           )
 
-            DisconnectError queryStateId ( connectionId, error ) ->
+            DisconnectError queryId ( connectionId, error ) ->
                 let
                     l =
-                        (debugLog config) "DisconnectError" ( queryStateId, connectionId, error )
+                        (debugLog config) "DisconnectError" ( queryId, connectionId, error )
 
                     queryState =
-                        getQueryState queryStateId model
+                        getQueryState queryId model
                 in
-                    connectionFailure config model queryStateId error
+                    connectionFailure config model queryId error
 
-            Disconnect queryStateId connectionId ->
+            Disconnect queryId connectionId ->
                 let
                     l =
-                        (debugLog config) "Disconnect" ( queryStateId, connectionId )
+                        (debugLog config) "Disconnect" ( queryId, connectionId )
                 in
                     ( model ! [], [] )
 
-            Events queryStateId ( connectionId, eventStrs ) ->
+            Events queryId ( connectionId, eventStrs ) ->
                 let
                     l =
-                        (debugFLog config) "Events" ( queryStateId, connectionId, eventStrs )
+                        (debugFLog config) "Events" ( queryId, connectionId, eventStrs )
 
                     ( updatedModel, msgs ) =
-                        processEvents config model queryStateId eventStrs
+                        processEvents config model queryId eventStrs
 
                     queryState =
-                        getQueryState queryStateId model
+                        getQueryState queryId model
 
                     goodQueryState =
                         queryState.badQueryState == False
@@ -208,10 +209,10 @@ update config msg model =
                         goodQueryState
                             ? ( case startOfQuery of
                                     True ->
-                                        startQuery config updatedModel queryStateId connectionId
+                                        startQuery config updatedModel queryId connectionId
 
                                     False ->
-                                        ( updatedModel, nextQuery queryStateId connectionId )
+                                        ( updatedModel, nextQuery queryId connectionId )
                               , model ! []
                               )
 
@@ -220,19 +221,19 @@ update config msg model =
                         cmd == Cmd.none
 
                     ( finalMsgs, finalCmd ) =
-                        endOfQuery ? ( ( List.append msgs [ config.completionTagger queryStateId ], Postgres.disconnect (DisconnectError queryStateId) (Disconnect queryStateId) connectionId False ), ( msgs, cmd ) )
+                        endOfQuery ? ( ( List.append msgs [ config.completionTagger queryId ], Postgres.disconnect (DisconnectError queryId) (Disconnect queryId) connectionId False ), ( msgs, cmd ) )
                 in
                     ( finalModel ! [ finalCmd ], finalMsgs )
 
-            QueryError queryStateId ( connectionId, error ) ->
+            QueryError queryId ( connectionId, error ) ->
                 let
                     l =
-                        (debugLog config) "QueryError" ( queryStateId, connectionId, error )
+                        (debugLog config) "QueryError" ( queryId, connectionId, error )
 
                     queryState =
-                        getQueryState queryStateId model
+                        getQueryState queryId model
                 in
-                    connectionFailure config model queryStateId error
+                    connectionFailure config model queryId error
 
             RetryConnectCmd retryCount failureMsg cmd ->
                 let
@@ -241,16 +242,16 @@ update config msg model =
 
                     parentMsg =
                         case failureMsg of
-                            ConnectError queryStateId ( connectionId, error ) ->
-                                nonFatal queryStateId ("Connection Error:" +-+ error +-+ "Connection Retry:" +-+ retryCount)
+                            ConnectError queryId ( connectionId, error ) ->
+                                nonFatal queryId ("Connection Error:" +-+ error +-+ "Connection Retry:" +-+ retryCount)
 
                             _ ->
                                 Debug.crash "BUG -- Should never get here"
                 in
                     ( model ! [ cmd ], [ parentMsg ] )
 
-            RetryModule msg ->
-                updateRetry msg model
+            RetryMsg queryId msg ->
+                updateRetry queryId msg model
 
 
 {-|
@@ -258,71 +259,67 @@ update config msg model =
 -}
 executeQuery : Config msg -> DbConnectionInfo -> Model msg -> Maybe String -> Query msg -> List String -> Result (List String) ( Model msg, Cmd msg, Int )
 executeQuery config dbConnectionInfo model additionalCriteria query rootIds =
-    let
-        templateResult =
-            buildQueryTemplate query
-    in
-        templateResult
-            |??>
-                (\templates ->
-                    let
-                        queryStateId =
-                            model.nextId
+    buildQueryTemplate query
+        |??>
+            (\templates ->
+                let
+                    queryId =
+                        model.nextId
 
-                        rootEntityName =
-                            case query of
-                                Node nodeQuery _ ->
-                                    nodeQuery.schema.entityName
+                    rootEntityName =
+                        case query of
+                            Node nodeQuery _ ->
+                                nodeQuery.schema.entityName
 
-                                Leaf nodeQuery ->
-                                    nodeQuery.schema.entityName
+                            Leaf nodeQuery ->
+                                nodeQuery.schema.entityName
 
-                        queryState =
-                            { rootEntityName = rootEntityName
-                            , badQueryState = False
-                            , currentTemplate = 0
-                            , templates = templates
-                            , rootIds = rootIds
-                            , ids = Dict.empty
-                            , additionalCriteria = additionalCriteria
-                            , maxIds = Dict.empty
-                            , firstTemplateWithDataMaxId = -1
-                            , msgDict = buildMsgDict query
-                            , first = True
-                            }
+                    queryState =
+                        { rootEntityName = rootEntityName
+                        , badQueryState = False
+                        , currentTemplate = 0
+                        , templates = templates
+                        , rootIds = rootIds
+                        , ids = Dict.empty
+                        , additionalCriteria = additionalCriteria
+                        , maxIds = Dict.empty
+                        , firstTemplateWithDataMaxId = -1
+                        , msgDict = buildMsgDict query
+                        , first = True
+                        }
 
-                        ( newModel, cmd ) =
-                            connectToDb config dbConnectionInfo { model | nextId = model.nextId + 1, queryStates = Dict.insert queryStateId queryState model.queryStates } queryStateId
-                    in
-                        ( newModel, cmd, queryStateId )
-                )
+                    ( newModel, cmd ) =
+                        connectToDb config dbConnectionInfo { model | nextId = model.nextId + 1, queryStates = Dict.insert queryId queryState model.queryStates } queryId
+                in
+                    ( newModel, cmd, queryId )
+            )
 
 
 {-|
     Refresh an existing Slate Query, i.e. process events since the last `executeQuery` or `refreshQuery`.
 -}
-refreshQuery : Config msg -> DbConnectionInfo -> Model msg -> QueryStateId -> Result String ( Model msg, Cmd msg )
-refreshQuery config dbConnectionInfo model queryStateId =
-    Dict.get queryStateId model.queryStates
+refreshQuery : Config msg -> DbConnectionInfo -> Model msg -> QueryId -> Result String ( Model msg, Cmd msg )
+refreshQuery config dbConnectionInfo model queryId =
+    Dict.get queryId model.queryStates
         |?> (\queryState ->
                 let
                     newQueryState =
                         { queryState | currentTemplate = 0, firstTemplateWithDataMaxId = -1 }
 
                     ( newModel, cmd ) =
-                        connectToDb config dbConnectionInfo { model | queryStates = Dict.insert queryStateId newQueryState model.queryStates } queryStateId
+                        connectToDb config dbConnectionInfo { model | queryStates = Dict.insert queryId newQueryState model.queryStates } queryId
                 in
                     Ok ( newModel, cmd )
             )
-        ?= Err ("Invalid QueryStateId:" +-+ queryStateId)
+        ?= Err ("Invalid QueryId:" +-+ queryId)
 
 
 {-|
-    Stop managing specified `Query`. Afterwards, the `queryStateId` will no longer be valid.
+    Stop managing specified `Query`. Afterwards, the `queryId` will no longer be valid.
 -}
-disposeQuery : Model msg -> QueryStateId -> Model msg
-disposeQuery model queryStateId =
-    { model | queryStates = Dict.remove queryStateId model.queryStates }
+disposeQuery : Model msg -> QueryId -> Model msg
+disposeQuery model queryId =
+    { model | queryStates = Dict.remove queryId model.queryStates }
 
 
 {-|
@@ -330,11 +327,11 @@ disposeQuery model queryStateId =
     This is necessary since the Engine proactively loads ids for children as a parent's messages are being processed.
     But when a parent entity is destroyed, we don't want to load all if it's children anymore.
 -}
-cascadingDeleteOccurred : Model msg -> QueryStateId -> CascadingDelete -> Model msg
-cascadingDeleteOccurred model queryStateId cascadingDelete =
+cascadingDeleteOccurred : Model msg -> QueryId -> CascadingDelete -> Model msg
+cascadingDeleteOccurred model queryId cascadingDelete =
     let
         queryState =
-            getQueryState queryStateId model
+            getQueryState queryId model
 
         deleteIds : EntityName -> List RelationshipId -> QueryState msg -> QueryState msg
         deleteIds entityName relationshipIds queryState =
@@ -351,39 +348,52 @@ cascadingDeleteOccurred model queryStateId cascadingDelete =
             cascadingDelete
                 |> List.foldl (\( entityName, relationshipIds ) -> deleteIds entityName relationshipIds) queryState
     in
-        { model | queryStates = Dict.insert queryStateId newQueryState model.queryStates }
+        { model | queryStates = Dict.insert queryId newQueryState model.queryStates }
 
 
-{-|
-    Create a JSON String for saving the specified `QueryState`.
-
-    This is useful for caching a query or saving for a subsequent execution of your App.
+{-| Create a JSON String for saving the specified `QueryState`.
 -}
-exportQueryState : Model msg -> QueryStateId -> Result String String
-exportQueryState model queryStateId =
-    Dict.get queryStateId model.queryStates
+exportQueryState : Model msg -> QueryId -> Result String String
+exportQueryState model queryId =
+    Dict.get queryId model.queryStates
         |?> (\queryState -> Ok <| queryStateEncode queryState)
-        ?= Err ("Invalid QueryStateId:" +-+ queryStateId)
+        ?= Err ("Invalid QueryId:" +-+ queryId)
 
 
-{-|
-    Recreate a previously saved `QueryState` from the specified JSON String.
+{-| importQuery query mismatch error
 -}
-importQueryState : Query msg -> Model msg -> String -> Result String (Model msg)
+importQueryMismatchError : String
+importQueryMismatchError =
+    "Import Query Mismatch"
+
+
+{-| Recreate a previously saved `QueryState` from the specified JSON String.
+-}
+importQueryState : Query msg -> Model msg -> String -> Result String ( QueryId, Model msg )
 importQueryState query model json =
-    let
-        templateResult =
-            buildQueryTemplate query
-    in
-        (queryStateDecode (buildMsgDict query) json)
-            |??>
-                (\queryState ->
-                    let
-                        queryStateId =
-                            model.nextId
-                    in
-                        { model | nextId = model.nextId + 1, queryStates = Dict.insert queryStateId queryState model.queryStates }
-                )
+    buildQueryTemplate query
+        |??>
+            (\templates ->
+                (queryStateDecode (buildMsgDict query) json)
+                    |??>
+                        (\queryState ->
+                            (templates == queryState.templates)
+                                ? ( model.nextId
+                                        |> (\queryId -> Ok ( queryId, { model | nextId = queryId + 1, queryStates = Dict.insert queryId queryState model.queryStates } ))
+                                  , Err importQueryMismatchError
+                                  )
+                        )
+                    ??= Err
+            )
+        ??= (Err << String.join "\n")
+
+
+{-| check to make sure that query state is good
+-}
+isGoodQueryState : Model msg -> QueryId -> Bool
+isGoodQueryState model queryId =
+    getQueryState queryId model
+        |> .badQueryState
 
 
 
@@ -392,7 +402,7 @@ importQueryState query model json =
 
 debugLog : Config msg -> String -> a -> a
 debugLog config prefix =
-    config.debug ? ( Debug.log prefix, identity )
+    config.debug ? ( Debug.log ("*** DEBUG:Query Engine" +-+ prefix), identity )
 
 
 debugFLog : Config msg -> String -> a -> a
@@ -400,11 +410,11 @@ debugFLog config prefix =
     config.debug ? ( DebugF.log prefix, identity )
 
 
-retryConfig : Retry.Config Msg
-retryConfig =
-    { retryMax = 3
+retryConfig : Config msg -> QueryId -> Retry.Config Msg
+retryConfig config queryId =
+    { retryMax = config.connectionRetryMax
     , delayNext = Retry.constantDelay 5000
-    , routeToMeTagger = RetryModule
+    , routeToMeTagger = RetryMsg queryId
     }
 
 
@@ -433,9 +443,9 @@ queryStateEncode queryState =
             , ( "currentTemplate", JE.int queryState.currentTemplate )
             , ( "templates", JE.list <| List.map JE.string queryState.templates )
             , ( "rootIds", JE.list <| List.map JE.string queryState.rootIds )
-            , ( "ids", JsonU.encDict JE.string (JE.list << List.map JE.string << Set.toList) queryState.ids )
-            , ( "additionalCriteria", JsonU.encMaybe JE.string queryState.additionalCriteria )
-            , ( "maxIds", JsonU.encDict JE.string JE.int queryState.maxIds )
+            , ( "ids", Json.encDict JE.string (JE.list << List.map JE.string << Set.toList) queryState.ids )
+            , ( "additionalCriteria", Json.encMaybe JE.string queryState.additionalCriteria )
+            , ( "maxIds", Json.encDict JE.string JE.int queryState.maxIds )
             , ( "firstTemplateWithDataMaxId", JE.int queryState.firstTemplateWithDataMaxId )
             ]
 
@@ -450,32 +460,32 @@ queryStateDecode msgDict json =
             <|| (field "currentTemplate" JD.int)
             <|| (field "templates" <| JD.list JD.string)
             <|| (field "rootIds" <| JD.list JD.string)
-            <|| (field "ids" <| JsonU.decConvertDict Set.fromList JD.string (JD.list JD.string))
+            <|| (field "ids" <| Json.decConvertDict Set.fromList JD.string (JD.list JD.string))
             <|| (field "additionalCriteria" <| JD.maybe JD.string)
-            <|| (field "maxIds" <| JsonU.decDict JD.string JD.int)
+            <|| (field "maxIds" <| Json.decDict JD.string JD.int)
             <|| (field "firstTemplateWithDataMaxId" JD.int)
             <|| JD.succeed msgDict
         )
         json
 
 
-getQueryState : QueryStateId -> Model msg -> QueryState msg
-getQueryState queryStateId model =
-    case Dict.get queryStateId model.queryStates of
+getQueryState : QueryId -> Model msg -> QueryState msg
+getQueryState queryId model =
+    case Dict.get queryId model.queryStates of
         Just queryState ->
             queryState
 
         Nothing ->
-            Debug.crash <| "Query Id: " ++ (toString queryStateId) ++ " is not in model: " ++ (toString model)
+            Debug.crash <| "Query Id: " ++ (toString queryId) ++ " is not in model: " ++ (toString model)
 
 
-connectionFailure : Config msg -> Model msg -> QueryStateId -> String -> ( ( Model msg, Cmd Msg ), List msg )
-connectionFailure config model queryStateId error =
+connectionFailure : Config msg -> Model msg -> QueryId -> String -> ( ( Model msg, Cmd Msg ), List msg )
+connectionFailure config model queryId error =
     let
         queryState =
-            getQueryState queryStateId model
+            getQueryState queryId model
     in
-        ( model ! [], [ config.errorTagger ( NonFatalError, ( queryStateId, error ) ) ] )
+        ( model ! [], [ config.errorTagger ( NonFatalError, ( queryId, error ) ) ] )
 
 
 templateReplace : List ( String, String ) -> String -> String
@@ -488,14 +498,11 @@ quoteList =
     List.map (\s -> "'" ++ s ++ "'")
 
 
-startQuery : Config msg -> Model msg -> QueryStateId -> ConnectionId -> ( Model msg, Cmd Msg )
-startQuery config model queryStateId connectionId =
+startQuery : Config msg -> Model msg -> QueryId -> ConnectionId -> ( Model msg, Cmd Msg )
+startQuery config model queryId connectionId =
     let
         queryState =
-            getQueryState queryStateId model
-
-        maybeTemplate =
-            List.head <| (List.drop queryState.currentTemplate queryState.templates)
+            getQueryState queryId model
 
         firstTemplate =
             queryState.currentTemplate == 0
@@ -517,12 +524,12 @@ startQuery config model queryStateId connectionId =
             firstTemplate ? ( Dict.insert queryState.rootEntityName (Set.fromList queryState.rootIds) Dict.empty, queryState.ids )
 
         lastMaxId =
-            toString (queryState.first ? ( -1, (ListE.foldl1 max <| Dict.values queryState.maxIds) ?= -1 ))
+            toString (queryState.first ? ( -1, (List.foldl1 max <| Dict.values queryState.maxIds) ?= -1 ))
 
         updateQueryState model queryState =
-            { model | queryStates = Dict.insert queryStateId queryState model.queryStates }
+            { model | queryStates = Dict.insert queryId queryState model.queryStates }
     in
-        maybeTemplate
+        (List.head <| (List.drop queryState.currentTemplate queryState.templates))
             |?> (\template ->
                     let
                         sqlTemplate =
@@ -549,17 +556,22 @@ startQuery config model queryStateId connectionId =
                             RegexU.replace All "\\{\\{.+?\\-entityIds\\}\\}" (RegexU.simpleReplacer "1!=1") sqlWithEntityIds
                     in
                         ( updateQueryState model { queryState | currentTemplate = queryState.currentTemplate + 1 }
-                        , Postgres.query (QueryError queryStateId) (Events queryStateId) connectionId sql config.queryBatchSize
+                        , query queryId (QueryError queryId) (Events queryId) connectionId sql config.queryBatchSize
                         )
                 )
             ?= ( updateQueryState model { queryState | first = False }, Cmd.none )
 
 
-processEvents : Config msg -> Model msg -> QueryStateId -> List String -> ( Model msg, List msg )
-processEvents config model queryStateId eventStrs =
+query : QueryId -> Postgres.ErrorTagger msg -> QueryTagger msg -> ConnectionId -> Sql -> Int -> Cmd msg
+query queryId errorTagger queryTagger connectionId sql =
+    Postgres.query errorTagger queryTagger connectionId ("-- Engine:: (QueryId, ConnectionId):" +-+ ( queryId, connectionId ) ++ "\n" ++ sql)
+
+
+processEvents : Config msg -> Model msg -> QueryId -> List String -> ( Model msg, List msg )
+processEvents config model queryId eventStrs =
     let
         queryState =
-            getQueryState queryStateId model
+            getQueryState queryId model
 
         eventNotInDict =
             "Event not in message dictionary:" +-+ queryState.msgDict
@@ -585,77 +597,82 @@ processEvents config model queryStateId eventStrs =
                                         resultRecordId =
                                             toInt eventRecord.id
 
-                                        entityName =
-                                            getEntityName event ??= (\error -> Debug.crash ("Program bug: Cannot get entityName. Error:" +-+ error))
+                                        resultEntityName =
+                                            getEntityName event
 
                                         eventType =
                                             event |> getEventType |> eventTypeToComparable
                                     in
-                                        resultRecordId
+                                        resultEntityName
                                             |??>
-                                                (\recordId ->
-                                                    Dict.get ( entityName, eventType ) queryState.msgDict
-                                                        |?> (\{ tagger, maybeRelationshipEntityName } ->
-                                                                let
-                                                                    newMsgs =
-                                                                        (tagger queryStateId eventRecord) :: msgs
+                                                (\entityName ->
+                                                    resultRecordId
+                                                        |??>
+                                                            (\recordId ->
+                                                                Dict.get ( entityName, eventType ) queryState.msgDict
+                                                                    |?> (\{ tagger, maybeRelationshipEntityName } ->
+                                                                            let
+                                                                                newMsgs =
+                                                                                    (tagger queryId eventRecord) :: msgs
 
-                                                                    firstTemplateWithDataMaxId =
-                                                                        max queryState.firstTemplateWithDataMaxId ((Result.toMaybe <| toInt <| eventRecord.max ?= "-1") ?= -1)
-                                                                in
-                                                                    {- add relationship entities to ids dictionary for next SQL query -}
-                                                                    maybeRelationshipEntityName
-                                                                        |?> (\relationshipEntityName ->
-                                                                                let
-                                                                                    currentEntityMaxId =
-                                                                                        (Dict.get relationshipEntityName queryState.maxIds) ?= -1
+                                                                                firstTemplateWithDataMaxId =
+                                                                                    max queryState.firstTemplateWithDataMaxId ((Result.toMaybe <| toInt <| eventRecord.max ?= "-1") ?= -1)
 
-                                                                                    entityMaxId =
-                                                                                        max currentEntityMaxId recordId
-
-                                                                                    ids =
-                                                                                        Dict.get relationshipEntityName queryState.ids ?= Set.empty
-                                                                                in
-                                                                                    getRelationshipId event
-                                                                                        |??>
-                                                                                            (\relationshipId ->
-                                                                                                ( { queryState
-                                                                                                    | firstTemplateWithDataMaxId = firstTemplateWithDataMaxId
-                                                                                                    , ids = Dict.insert relationshipEntityName (Set.insert relationshipId ids) queryState.ids
-                                                                                                    , maxIds = Dict.insert relationshipEntityName entityMaxId queryState.maxIds
-                                                                                                  }
-                                                                                                , newMsgs
-                                                                                                )
-                                                                                            )
-                                                                                        ??= (\_ -> ( queryState, newMsgs ))
-                                                                            )
-                                                                        ?= ( { queryState | firstTemplateWithDataMaxId = firstTemplateWithDataMaxId }
-                                                                           , newMsgs
-                                                                           )
+                                                                                entityMaxId entityName =
+                                                                                    max (Dict.get entityName queryState.maxIds ?= -1) recordId
+                                                                            in
+                                                                                {- add relationship entities to ids dictionary for next SQL query -}
+                                                                                maybeRelationshipEntityName
+                                                                                    |?> (\relationshipEntityName ->
+                                                                                            let
+                                                                                                ids =
+                                                                                                    Dict.get relationshipEntityName queryState.ids ?= Set.empty
+                                                                                            in
+                                                                                                getRelationshipId event
+                                                                                                    |??>
+                                                                                                        (\relationshipId ->
+                                                                                                            ( { queryState
+                                                                                                                | firstTemplateWithDataMaxId = firstTemplateWithDataMaxId
+                                                                                                                , ids = Dict.insert relationshipEntityName (Set.insert relationshipId ids) queryState.ids
+                                                                                                                , maxIds = Dict.insert relationshipEntityName (entityMaxId relationshipEntityName) queryState.maxIds
+                                                                                                              }
+                                                                                                            , newMsgs
+                                                                                                            )
+                                                                                                        )
+                                                                                                    ??= (\_ -> ( queryState, newMsgs ))
+                                                                                        )
+                                                                                    ?= ( { queryState
+                                                                                            | firstTemplateWithDataMaxId = firstTemplateWithDataMaxId
+                                                                                            , maxIds = Dict.insert entityName (entityMaxId entityName) queryState.maxIds
+                                                                                         }
+                                                                                       , newMsgs
+                                                                                       )
+                                                                        )
+                                                                    ?= eventError eventStr msgs eventNotInDict
                                                             )
-                                                        ?= eventError eventStr msgs eventNotInDict
+                                                        ??= (\error -> eventError eventStr msgs ("Corrupt Event Record -- Invalid id:" +-+ error))
                                                 )
-                                            ??= (\_ -> eventError eventStr msgs "Corrupt Event Record -- Invalid Id")
+                                            ??= (\error -> eventError eventStr msgs ("Corrupt Event Record -- Missing entityName: Error:" +-+ error))
                                 )
                             ??= (\decodingErr -> eventError eventStr msgs decodingErr)
                 )
                 ( queryState, [] )
                 eventStrs
     in
-        ( { model | queryStates = Dict.insert queryStateId newQueryState model.queryStates }, List.reverse msgs )
+        ( { model | queryStates = Dict.insert queryId newQueryState model.queryStates }, List.reverse msgs )
 
 
-nextQuery : QueryStateId -> ConnectionId -> Cmd Msg
-nextQuery queryStateId connectionId =
-    Postgres.moreQueryResults (QueryError queryStateId) (Events queryStateId) connectionId
+nextQuery : QueryId -> ConnectionId -> Cmd Msg
+nextQuery queryId connectionId =
+    Postgres.moreQueryResults (QueryError queryId) (Events queryId) connectionId
 
 
-connectToDbCmd : Config msg -> DbConnectionInfo -> Model msg -> QueryStateId -> FailureTagger ( ConnectionId, String ) Msg -> Cmd Msg
-connectToDbCmd config dbConnectionInfo model queryStateId failureTagger =
+connectToDbCmd : Config msg -> DbConnectionInfo -> Model msg -> QueryId -> Retry.FailureTagger ( ConnectionId, String ) Msg -> Cmd Msg
+connectToDbCmd config dbConnectionInfo model queryId failureTagger =
     Postgres.connect
         failureTagger
-        (Connect queryStateId)
-        (ConnectionLost queryStateId)
+        (Connect queryId)
+        (ConnectionLost queryId)
         dbConnectionInfo.timeout
         dbConnectionInfo.host
         dbConnectionInfo.port_
@@ -664,10 +681,10 @@ connectToDbCmd config dbConnectionInfo model queryStateId failureTagger =
         dbConnectionInfo.password
 
 
-connectToDb : Config msg -> DbConnectionInfo -> Model msg -> QueryStateId -> ( Model msg, Cmd msg )
-connectToDb config dbConnectionInfo model queryStateId =
+connectToDb : Config msg -> DbConnectionInfo -> Model msg -> QueryId -> ( Model msg, Cmd msg )
+connectToDb config dbConnectionInfo model queryId =
     let
         ( retryModel, retryCmd ) =
-            Retry.retry retryConfig model.retryModel (ConnectError queryStateId) RetryConnectCmd (connectToDbCmd config dbConnectionInfo model queryStateId)
+            Retry.retry (retryConfig config queryId) Retry.initModel (ConnectError queryId) RetryConnectCmd (connectToDbCmd config dbConnectionInfo model queryId)
     in
-        { model | retryModel = retryModel } ! [ Cmd.map config.routeToMeTagger retryCmd ]
+        { model | retryModels = Dict.insert queryId retryModel model.retryModels } ! [ Cmd.map config.routeToMeTagger retryCmd ]

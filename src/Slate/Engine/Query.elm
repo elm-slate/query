@@ -11,19 +11,22 @@ module Slate.Engine.Query
         , parametricReplace
         , buildMsgDict
         , getQueryEventTypes
+        , partialQueryEncoder
+        , makeComparable
         )
 
 {-|
     Slate Query module.
 
-@docs NodeQuery , Query , MsgDict , MsgDictEntry , EventTagger, QueryId, mtQuery , buildQueryTemplate , parametricReplace , buildMsgDict, getQueryEventTypes
+@docs NodeQuery , Query , MsgDict , MsgDictEntry , EventTagger, QueryId, mtQuery , buildQueryTemplate , parametricReplace , buildMsgDict, getQueryEventTypes,partialQueryEncoder, makeComparable
 -}
 
-import String exposing (..)
 import Dict exposing (..)
 import Set exposing (..)
 import Tuple exposing (first, second)
 import Regex exposing (HowMany(All, AtMost))
+import Json.Encode as JE exposing (..)
+import Utils.Json as Json exposing (..)
 import List.Extra as ListE exposing (..)
 import StringUtils exposing (..)
 import Utils.Regex as RegexU
@@ -41,8 +44,7 @@ import Slate.Common.Event exposing (EventRecord)
 ---------------------------------------------------------------------------------------------------------
 
 
-{-|
-    A query that can be used at any node in Query.
+{-| query idA query that can be used at any node in Query.
 -}
 type alias NodeQuery msg =
     { properties : Maybe (List PropertyName)
@@ -56,16 +58,14 @@ type alias Children msg =
     List (Query msg)
 
 
-{-|
-    A Query definition.
+{-| query idA Query definition.
 -}
 type Query msg
     = Node (NodeQuery msg) (Children msg)
     | Leaf (NodeQuery msg)
 
 
-{-|
-    MsgDict entry.
+{-| query idMsgDict entry.
 -}
 type alias MsgDictEntry msg =
     { tagger : EventTagger msg
@@ -73,28 +73,25 @@ type alias MsgDictEntry msg =
     }
 
 
-{-|
-    Msg Dictionary that relates the Slate Event Name to the taggers in the query.
+{-| query idMsg Dictionary that relates the Slate Event Name to the taggers in the query.
 -}
 type alias MsgDict msg =
     Dict ( EntityName, ComparableEventType ) (MsgDictEntry msg)
 
 
-{-|
+{-| query id
 -}
 type alias QueryId =
     Int
 
 
-{-|
-    Msg constructor that takes a EventRecord.
+{-| Msg constructor that takes a EventRecord.
 -}
 type alias EventTagger msg =
     QueryId -> EventRecord -> msg
 
 
-{-|
-    Convenience function for defining queries.
+{-| Convenience function for defining queries.
 -}
 mtQuery : EventTagger msg -> NodeQuery msg
 mtQuery unhandledSpecifiedTagger =
@@ -105,8 +102,7 @@ mtQuery unhandledSpecifiedTagger =
     }
 
 
-{-|
-    Build Query Template from a query.
+{-| Build Query Template from a query.
 -}
 buildQueryTemplate : Query msg -> Result (List String) (List String)
 buildQueryTemplate query =
@@ -126,8 +122,7 @@ buildQueryTemplate query =
                 Err errors
 
 
-{-|
-    Parametric replacement of a template where the `prefix` and `suffix` define the delimiters of the parameters.
+{-| Parametric replacement of a template where the `prefix` and `suffix` define the delimiters of the parameters.
 -}
 parametricReplace : String -> String -> List ( String, String ) -> String -> String
 parametricReplace prefix suffix replacements template =
@@ -140,8 +135,7 @@ parametricReplace prefix suffix replacements template =
         List.foldl (\( param, value ) template -> RegexU.replaceAll (buildRegex param) value template) template replacements
 
 
-{-|
-    Build a Msg Dictionary that relates the Slate Event Name to the taggers in the query.
+{-| Build a Msg Dictionary that relates the Slate Event Name to the taggers in the query.
 -}
 buildMsgDict : Query msg -> MsgDict msg
 buildMsgDict query =
@@ -195,10 +189,41 @@ getQueryEventTypes query =
             |> List.concat
 
 
+{-| make query comparable
+-}
+makeComparable : Query msg -> String
+makeComparable query =
+    JE.encode 0 <| partialQueryEncoder query
+
+
+{-| Query encoder
+-}
+partialQueryEncoder : Query msg -> JE.Value
+partialQueryEncoder query =
+    JE.object <|
+        case query of
+            Node nodeQuery children ->
+                [ ( "node", partialNodeQueryEncoder nodeQuery )
+                , ( "children", (JE.list << List.map partialQueryEncoder) children )
+                ]
+
+            Leaf nodeQuery ->
+                [ ( "leaf", partialNodeQueryEncoder nodeQuery ) ]
+
+
 
 ---------------------------------------------------------------------------------------------------------
 -- PRIVATE
 ---------------------------------------------------------------------------------------------------------
+
+
+partialNodeQueryEncoder : NodeQuery msg -> JE.Value
+partialNodeQueryEncoder nodeQuery =
+    JE.object <|
+        [ ( "properties", Json.encMaybe (JE.list << List.map JE.string) nodeQuery.properties )
+        , ( "criteria", Json.encMaybe JE.string nodeQuery.criteria )
+        , ( "schema", partialSchemaEncoder nodeQuery.schema )
+        ]
 
 
 type alias ParentChildRelationships msg =
