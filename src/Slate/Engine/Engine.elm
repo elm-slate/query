@@ -392,8 +392,10 @@ importQueryState query model json =
 -}
 isGoodQueryState : Model msg -> QueryId -> Bool
 isGoodQueryState model queryId =
-    getQueryState queryId model
-        |> .badQueryState
+    not
+        (getQueryState queryId model
+            |> .badQueryState
+        )
 
 
 
