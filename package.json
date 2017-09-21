@@ -1,0 +1,21 @@
+{
+  "name": "@elm-slate/query",
+  "version": "3.0.2",
+  "description": "Slate Query Engine",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/elm-slate/query.git"
+  },
+  "author": "",
+  "license": "Unlicense",
+  "bugs": {
+    "url": "https://github.com/elm-slate/query/issues"
+  },
+  "homepage": "https://github.com/elm-slate/query#readme",
+"dependencies": {
+    "@panosoft/elm-postgres": "elm-stuff/grove/packages/panosoft/elm-postgres/installed"
+  }
+}
